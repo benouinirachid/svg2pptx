@@ -172,6 +172,91 @@ class TestAddToSlide:
         assert len(slide.shapes) >= 2
 
 
+class TestGradientOnRotatedShapes:
+    """Regression tests for gradient direction on rotated shapes."""
+
+    def _get_gradient_angle(self, prs) -> float:
+        """Extract gradient angle from the first gradient-filled shape."""
+        import lxml.etree as etree
+        NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+        for shape in prs.slides[0].shapes:
+            sp = shape._element
+            for gradFill in sp.iter(f"{{{NS}}}gradFill"):
+                lin = gradFill.find(f"{{{NS}}}lin")
+                if lin is not None:
+                    ang = int(lin.get("ang", "0"))
+                    return ang / 60000.0  # convert from 1/60000 degree units
+        return None
+
+    def test_gradient_direction_unrotated_rect(self):
+        """A horizontal gradient on a non-rotated rect stays horizontal (angle≈0°)."""
+        svg = '''<svg xmlns="http://www.w3.org/2000/svg"
+                      xmlns:xlink="http://www.w3.org/1999/xlink"
+                      width="100" height="50">
+          <defs>
+            <linearGradient id="g1">
+              <stop offset="0" style="stop-color:#000000;stop-opacity:1"/>
+              <stop offset="1" style="stop-color:#ffffff;stop-opacity:1"/>
+            </linearGradient>
+            <linearGradient xlink:href="#g1" id="g2"
+              x1="0" y1="0" x2="100" y2="0" gradientUnits="userSpaceOnUse"/>
+          </defs>
+          <rect x="0" y="0" width="100" height="50" fill="url(#g2)"/>
+        </svg>'''
+        converter = SVGConverter()
+        prs = converter.convert_string(svg)
+        angle = self._get_gradient_angle(prs)
+        assert angle is not None
+        # horizontal gradient → angle ≈ 0°
+        assert abs(angle % 360) < 1.0 or abs((angle % 360) - 360) < 1.0
+
+    def test_gradient_direction_rotated90_rect(self):
+        """A horizontal gradient on a rect rotated 90° becomes vertical (different from 0°)."""
+        svg = '''<svg xmlns="http://www.w3.org/2000/svg"
+                      xmlns:xlink="http://www.w3.org/1999/xlink"
+                      width="50" height="100">
+          <defs>
+            <linearGradient id="g1">
+              <stop offset="0" style="stop-color:#000000;stop-opacity:1"/>
+              <stop offset="1" style="stop-color:#ffffff;stop-opacity:1"/>
+            </linearGradient>
+            <linearGradient xlink:href="#g1" id="g2"
+              x1="0" y1="0" x2="100" y2="0" gradientUnits="userSpaceOnUse"/>
+          </defs>
+          <rect x="0" y="0" width="100" height="50" fill="url(#g2)"
+                transform="rotate(90)"/>
+        </svg>'''
+        converter = SVGConverter()
+        prs = converter.convert_string(svg)
+        angle = self._get_gradient_angle(prs)
+        assert angle is not None
+        # horizontal in local space + rotate(90) → vertical gradient, raw ang value = 90°
+        assert abs((angle % 360) - 90.0) < 1.0
+
+    def test_gradient_direction_rotated_minus90_rect(self):
+        """A horizontal gradient on a rect rotated -90° becomes vertical (opposite to rotate(90))."""
+        svg = '''<svg xmlns="http://www.w3.org/2000/svg"
+                      xmlns:xlink="http://www.w3.org/1999/xlink"
+                      width="50" height="100">
+          <defs>
+            <linearGradient id="g1">
+              <stop offset="0" style="stop-color:#000000;stop-opacity:1"/>
+              <stop offset="1" style="stop-color:#ffffff;stop-opacity:1"/>
+            </linearGradient>
+            <linearGradient xlink:href="#g1" id="g2"
+              x1="0" y1="0" x2="100" y2="0" gradientUnits="userSpaceOnUse"/>
+          </defs>
+          <rect x="0" y="0" width="100" height="50" fill="url(#g2)"
+                transform="rotate(-90)"/>
+        </svg>'''
+        converter = SVGConverter()
+        prs = converter.convert_string(svg)
+        angle = self._get_gradient_angle(prs)
+        assert angle is not None
+        # horizontal in local space + rotate(-90) → vertical gradient, raw ang value = 270°
+        assert abs((angle % 360) - 270.0) < 1.0
+
+
 class TestConfig:
     """Tests for configuration options."""
 

@@ -82,7 +82,7 @@ def create_rectangle(
     else:
         shape = shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
 
-    apply_style(shape, rect.style)
+    apply_style(shape, rect.style, rect.transform)
     return shape
 
 
@@ -108,7 +108,7 @@ def create_oval(
     height = px_to_emu(2 * ry * scale)
 
     shape = shapes.add_shape(MSO_SHAPE.OVAL, left, top, width, height)
-    apply_style(shape, oval.style)
+    apply_style(shape, oval.style, oval.transform)
     return shape
 
 
@@ -157,7 +157,7 @@ def create_line(
     return connector
 
 
-def _apply_gradient_fill(fill, gradient: LinearGradient) -> None:
+def _apply_gradient_fill(fill, gradient: LinearGradient, transform: Optional[Transform] = None) -> None:
     """Apply a LinearGradient to a python-pptx FillFormat."""
     if not gradient.stops:
         fill.background()
@@ -168,6 +168,16 @@ def _apply_gradient_fill(fill, gradient: LinearGradient) -> None:
     # Formula: atan2(-dy, dx) gives that angle.
     dx = gradient.x2 - gradient.x1
     dy = gradient.y2 - gradient.y1
+
+    # For userSpaceOnUse gradients the direction vector is in the shape's local
+    # coordinate system. Apply the linear part of the cumulative shape transform
+    # to map it to screen space so the angle is correct for rotated shapes.
+    if transform is not None and gradient.gradient_units == "userSpaceOnUse":
+        dx, dy = (
+            transform.a * dx + transform.c * dy,
+            transform.b * dx + transform.d * dy,
+        )
+
     if dx == 0.0 and dy == 0.0:
         angle_deg = 0.0
     else:
@@ -199,13 +209,14 @@ def _apply_gradient_fill(fill, gradient: LinearGradient) -> None:
             etree.SubElement(srgb, f"{{{NS}}}alpha", val=str(alpha_val))
 
 
-def apply_style(shape: BaseShape, style: Style, disable_shadow: bool = True) -> None:
+def apply_style(shape: BaseShape, style: Style, transform: Optional[Transform] = None, disable_shadow: bool = True) -> None:
     """
     Apply SVG style to a PowerPoint shape.
 
     Args:
         shape: PowerPoint shape to style.
         style: Parsed SVG style.
+        transform: Cumulative shape transform, used to rotate gradient direction.
         disable_shadow: Whether to disable shadow on the shape. Defaults to True.
     """
     # Disable shadow if requested
@@ -222,7 +233,7 @@ def apply_style(shape: BaseShape, style: Style, disable_shadow: bool = True) -> 
     # Apply fill
     fill = shape.fill
     if style.gradient_fill is not None:
-        _apply_gradient_fill(fill, style.gradient_fill)
+        _apply_gradient_fill(fill, style.gradient_fill, transform)
     elif style.fill == "none":
         fill.background()
     else:
