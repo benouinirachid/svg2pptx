@@ -9,7 +9,12 @@ from pptx.util import Emu
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.dml.color import RGBColor
 
-from svg2pptx.parser.styles import Style, LinearGradient
+from svg2pptx.parser.styles import (
+    Style,
+    Gradient,
+    LinearGradient,
+    RadialGradient,
+)
 from svg2pptx.parser.shapes import (
     ParsedShape,
     RectShape,
@@ -145,7 +150,11 @@ def create_line(
         pass
 
     # Apply stroke style to line
-    if line.style.stroke != "none":
+    if line.style.gradient_stroke is not None:
+        _apply_gradient_fill(
+            connector.line.fill, line.style.gradient_stroke, line.transform
+        )
+    elif line.style.stroke != "none":
         try:
             color = parse_hex_color(line.style.stroke)
             connector.line.color.rgb = color
@@ -157,15 +166,64 @@ def create_line(
     return connector
 
 
-def _apply_gradient_fill(fill, gradient: LinearGradient, transform: Optional[Transform] = None) -> None:
-    """Apply a LinearGradient to a python-pptx FillFormat."""
+_DML_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+
+
+def _apply_gradient_fill(
+    fill, gradient: Gradient, transform: Optional[Transform] = None
+) -> None:
+    """Apply a linear or radial gradient to a python-pptx FillFormat.
+
+    Works for both shape fills (`shape.fill`) and line fills (`shape.line.fill`),
+    since both expose the same FillFormat interface.
+    """
     if not gradient.stops:
         fill.background()
         return
 
-    # Compute angle: SVG direction (dx,dy, y-down) → python-pptx gradient_angle
-    # python-pptx gradient_angle is degrees CCW from East in screen (y-down) space.
-    # Formula: atan2(-dy, dx) gives that angle.
+    fill.gradient()
+    _write_gradient_stops(fill, gradient.stops)
+
+    if isinstance(gradient, RadialGradient):
+        _make_radial_geometry(fill, gradient)
+    else:
+        _apply_linear_angle(fill, gradient, transform)
+
+
+def _write_gradient_stops(fill, stops) -> None:
+    """Replace the default gradient stops with the parsed SVG stops."""
+    import lxml.etree as etree
+
+    gsLst = fill.gradient_stops._gsLst
+
+    # python-pptx initialises gradFill with exactly 2 stops; clear them first.
+    for child in list(gsLst):
+        gsLst.remove(child)
+
+    for stop in stops:
+        pos = max(0, min(100000, int(round(stop.offset * 100000))))
+        hex_color = stop.color.lstrip("#").upper()
+        if len(hex_color) != 6:
+            continue
+        gs = etree.SubElement(gsLst, f"{{{_DML_NS}}}gs", pos=str(pos))
+        srgb = etree.SubElement(gs, f"{{{_DML_NS}}}srgbClr", val=hex_color)
+        if stop.opacity < 1.0:
+            alpha_val = max(0, min(100000, int(round(stop.opacity * 100000))))
+            etree.SubElement(srgb, f"{{{_DML_NS}}}alpha", val=str(alpha_val))
+
+
+def _apply_linear_angle(
+    fill, gradient: LinearGradient, transform: Optional[Transform]
+) -> None:
+    """Write the <a:lin> direction element for a linear gradient.
+
+    Written directly via lxml rather than python-pptx's ``gradient_angle``
+    setter, because ``line.fill.gradient()`` does not create an <a:lin> for the
+    setter to update (only ``shape.fill.gradient()`` does).
+    """
+    import lxml.etree as etree
+
+    # SVG direction (dx,dy, y-down) → angle CCW from East in screen space.
     dx = gradient.x2 - gradient.x1
     dy = gradient.y2 - gradient.y1
 
@@ -183,30 +241,59 @@ def _apply_gradient_fill(fill, gradient: LinearGradient, transform: Optional[Tra
     else:
         angle_deg = math.degrees(math.atan2(-dy, dx)) % 360.0
 
-    fill.gradient()
-    fill.gradient_angle = angle_deg
+    gsLst = fill.gradient_stops._gsLst
+    gradFill = gsLst.getparent()
+    for el in gradFill.findall(f"{{{_DML_NS}}}lin"):
+        gradFill.remove(el)
 
-    # python-pptx initialises gradFill with exactly 2 stops.
-    # Manipulate the underlying gsLst XML to place all SVG stops.
+    # OOXML <a:lin ang> is measured clockwise in 60000ths of a degree.
+    ooxml_ang = int(round((360.0 - angle_deg) * 60000))
+    etree.SubElement(
+        gradFill, f"{{{_DML_NS}}}lin", ang=str(ooxml_ang), scaled="0"
+    )
+
+
+def _make_radial_geometry(fill, gradient: RadialGradient) -> None:
+    """Convert the gradient into an OOXML radial (`<a:path path="circle">`).
+
+    OOXML radial gradients fill inward from the shape's bounding rectangle to a
+    focus rectangle, so this is a centered (optionally focus-shifted) circular
+    approximation of the SVG radial — cx/cy/fx/fy are honoured for
+    objectBoundingBox units, but r and elliptical/non-uniform radii are not.
+    """
     import lxml.etree as etree
 
-    NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
     gsLst = fill.gradient_stops._gsLst
+    gradFill = gsLst.getparent()
 
-    # Remove the default 2 stops
-    for child in list(gsLst):
-        gsLst.remove(child)
+    # python-pptx adds an <a:lin>; replace it (and any prior path) with a path.
+    for tag in ("lin", "path"):
+        for el in gradFill.findall(f"{{{_DML_NS}}}{tag}"):
+            gradFill.remove(el)
 
-    for stop in gradient.stops:
-        pos = max(0, min(100000, int(round(stop.offset * 100000))))
-        hex_color = stop.color.lstrip("#").upper()
-        if len(hex_color) != 6:
-            continue
-        gs = etree.SubElement(gsLst, f"{{{NS}}}gs", pos=str(pos))
-        srgb = etree.SubElement(gs, f"{{{NS}}}srgbClr", val=hex_color)
-        if stop.opacity < 1.0:
-            alpha_val = max(0, min(100000, int(round(stop.opacity * 100000))))
-            etree.SubElement(srgb, f"{{{NS}}}alpha", val=str(alpha_val))
+    path_el = etree.SubElement(gradFill, f"{{{_DML_NS}}}path", path="circle")
+
+    # Focus point as a fraction of the bounding box. For objectBoundingBox the
+    # focal/center coords are already in [0,1]; for userSpaceOnUse we lack the
+    # shape bbox here, so fall back to a centered focus.
+    if gradient.gradient_units == "objectBoundingBox":
+        fx = gradient.fx if gradient.fx is not None else gradient.cx
+        fy = gradient.fy if gradient.fy is not None else gradient.cy
+    else:
+        fx = fy = 0.5
+
+    def pct(v: float) -> str:
+        return str(max(0, min(100000, int(round(v * 100000)))))
+
+    # fillToRect insets collapse the fill origin to the focus point.
+    etree.SubElement(
+        path_el,
+        f"{{{_DML_NS}}}fillToRect",
+        l=pct(fx),
+        t=pct(fy),
+        r=pct(1.0 - fx),
+        b=pct(1.0 - fy),
+    )
 
 
 def apply_style(shape: BaseShape, style: Style, transform: Optional[Transform] = None, disable_shadow: bool = True) -> None:
@@ -246,7 +333,10 @@ def apply_style(shape: BaseShape, style: Style, transform: Optional[Transform] =
 
     # Apply stroke
     line = shape.line
-    if style.stroke == "none":
+    if style.gradient_stroke is not None:
+        _apply_gradient_fill(line.fill, style.gradient_stroke, transform)
+        line.width = Emu(px_to_emu(style.stroke_width))
+    elif style.stroke == "none":
         line.fill.background()  # No stroke
     else:
         try:

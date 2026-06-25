@@ -2,7 +2,7 @@
 
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 
 @dataclass
@@ -24,6 +24,30 @@ class LinearGradient:
     x2: float = 1.0
     y2: float = 0.0
     gradient_units: str = "objectBoundingBox"
+
+
+@dataclass
+class RadialGradient:
+    """Parsed SVG radialGradient definition.
+
+    OOXML radial gradients are far less expressive than SVG: they fill inward
+    from the shape's bounding rectangle toward a focus point, with no true
+    radius or elliptical control. Only the stop list, center/focus, and units
+    are preserved; the writer renders a centered (optionally focus-shifted)
+    circular approximation.
+    """
+
+    stops: list  # list[GradientStop]
+    cx: float = 0.5
+    cy: float = 0.5
+    r: float = 0.5
+    fx: Optional[float] = None
+    fy: Optional[float] = None
+    gradient_units: str = "objectBoundingBox"
+
+
+# A paint that is a gradient (either kind).
+Gradient = Union[LinearGradient, RadialGradient]
 
 
 # Named CSS colors to RGB hex
@@ -86,12 +110,8 @@ RGBA_PATTERN = re.compile(
 # Pattern for gradient references like url(#gradientId)
 URL_REF_PATTERN = re.compile(r"url\s*\(\s*#([^)]+)\s*\)", re.IGNORECASE)
 
-# Global registry for gradient/pattern colors extracted from <defs>
-# Maps gradient/pattern ID to a fallback solid color
-_gradient_colors: dict[str, str] = {}
-
-# Full gradient definitions registry
-_gradients: dict[str, "LinearGradient"] = {}
+# Gradient definitions registry, keyed by gradient ID (without #)
+_gradients: dict[str, "Gradient"] = {}
 
 
 @dataclass
@@ -122,7 +142,8 @@ class Style:
     font_size: float = 12.0
     font_weight: str = "normal"
     text_anchor: str = "start"
-    gradient_fill: Optional["LinearGradient"] = None
+    gradient_fill: Optional["Gradient"] = None
+    gradient_stroke: Optional["Gradient"] = None
 
     def with_parent(self, parent: "Style") -> "Style":
         """
@@ -158,6 +179,7 @@ class Style:
                 else parent.text_anchor
             ),
             gradient_fill=self.gradient_fill if self.gradient_fill is not None else parent.gradient_fill,
+            gradient_stroke=self.gradient_stroke if self.gradient_stroke is not None else parent.gradient_stroke,
         )
 
     @property
@@ -172,38 +194,23 @@ class Style:
 
 
 def clear_gradient_registry() -> None:
-    """Clear the gradient color registry. Call before parsing a new SVG."""
-    _gradient_colors.clear()
+    """Clear the gradient registry. Call before parsing a new SVG."""
     _gradients.clear()
 
 
-def get_gradient(gradient_id: str) -> Optional["LinearGradient"]:
-    """Return the full LinearGradient for the given id, or None."""
+def get_gradient(gradient_id: str) -> Optional["Gradient"]:
+    """Return the full gradient (linear or radial) for the id, or None."""
     return _gradients.get(gradient_id)
 
 
-def register_gradient_color(gradient_id: str, color: str) -> None:
-    """
-    Register a fallback color for a gradient.
-
-    Args:
-        gradient_id: The gradient/pattern ID (without #).
-        color: The fallback color (hex format).
-    """
-    _gradient_colors[gradient_id] = color
-
-
-def get_gradient_color(gradient_id: str) -> Optional[str]:
-    """
-    Get the fallback color for a gradient.
-
-    Args:
-        gradient_id: The gradient/pattern ID (without #).
-
-    Returns:
-        The registered color or None if not found.
-    """
-    return _gradient_colors.get(gradient_id)
+def _resolve_gradient_ref(paint_value: str) -> Optional["Gradient"]:
+    """Resolve a paint value to a gradient if it is a url(#id) to a known one."""
+    if not paint_value:
+        return None
+    url_match = URL_REF_PATTERN.match(paint_value.strip())
+    if not url_match:
+        return None
+    return get_gradient(url_match.group(1))
 
 
 def _parse_gradient_coord(value: str, default: float) -> float:
@@ -326,6 +333,11 @@ def parse_gradients_from_defs(defs_element) -> None:
             "y1": child.get("y1"),
             "x2": child.get("x2"),
             "y2": child.get("y2"),
+            "cx": child.get("cx"),
+            "cy": child.get("cy"),
+            "r": child.get("r"),
+            "fx": child.get("fx"),
+            "fy": child.get("fy"),
             "gradient_units": child.get("gradientUnits", "objectBoundingBox"),
             "gradient_transform": child.get("gradientTransform", ""),
         }
@@ -366,10 +378,42 @@ def parse_gradients_from_defs(defs_element) -> None:
                 gradient_units=info["gradient_units"],
             )
             _gradients[grad_id] = gradient
-            register_gradient_color(grad_id, stops[0].color)
 
         elif info["tag"] == "radialgradient":
-            register_gradient_color(grad_id, stops[0].color)
+            ref = raw.get(info["href"]) if info["href"] else None
+
+            def inherited(key: str):
+                """Attribute from this element, falling back to the href'd one."""
+                val = info.get(key)
+                if val is None and ref is not None:
+                    val = ref.get(key)
+                return val
+
+            try:
+                cx = _parse_gradient_coord(inherited("cx") or "0.5", 0.5)
+                cy = _parse_gradient_coord(inherited("cy") or "0.5", 0.5)
+                r = _parse_gradient_coord(inherited("r") or "0.5", 0.5)
+            except ValueError:
+                cx, cy, r = 0.5, 0.5, 0.5
+
+            fx_raw = inherited("fx")
+            fy_raw = inherited("fy")
+            try:
+                fx = _parse_gradient_coord(fx_raw, cx) if fx_raw is not None else None
+                fy = _parse_gradient_coord(fy_raw, cy) if fy_raw is not None else None
+            except ValueError:
+                fx, fy = None, None
+
+            gradient = RadialGradient(
+                stops=stops,
+                cx=cx,
+                cy=cy,
+                r=r,
+                fx=fx,
+                fy=fy,
+                gradient_units=info["gradient_units"],
+            )
+            _gradients[grad_id] = gradient
 
 
 def _parse_color_value(color_str: str) -> str:
@@ -442,14 +486,9 @@ def parse_color(color_str: str) -> str:
     if color_str_lower == "currentcolor":
         return "#000000"  # Default to black
 
-    # Check for gradient/pattern url() references
-    url_match = URL_REF_PATTERN.match(color_str_stripped)
-    if url_match:
-        ref_id = url_match.group(1)
-        gradient_color = get_gradient_color(ref_id)
-        if gradient_color:
-            return gradient_color
-        # Unknown reference, default to transparent/none
+    # url() paint references (gradients are resolved before reaching here, so
+    # any remaining reference — patterns, unknown ids — has no flat color).
+    if URL_REF_PATTERN.match(color_str_stripped):
         return "none"
 
     # Named colors
@@ -540,6 +579,7 @@ def parse_style(
             font_weight=parent_style.font_weight,
             text_anchor=parent_style.text_anchor,
             gradient_fill=parent_style.gradient_fill,
+            gradient_stroke=parent_style.gradient_stroke,
         )
     else:
         style = Style(fill=default_fill, stroke=default_stroke)
@@ -562,16 +602,10 @@ def parse_style(
     # Parse fill — detect gradient references before resolving to a flat color
     fill_val = get_attr("fill")
     if fill_val is not None:
-        url_match = URL_REF_PATTERN.match(fill_val.strip())
-        if url_match:
-            ref_id = url_match.group(1)
-            gradient = get_gradient(ref_id)
-            if gradient is not None:
-                style.gradient_fill = gradient
-                style.fill = "none"
-            else:
-                style.gradient_fill = None
-                style.fill = parse_color(fill_val)
+        gradient = _resolve_gradient_ref(fill_val)
+        if gradient is not None:
+            style.gradient_fill = gradient
+            style.fill = "none"
         else:
             style.gradient_fill = None
             style.fill = parse_color(fill_val)
@@ -584,10 +618,16 @@ def parse_style(
         except ValueError:
             pass
 
-    # Parse stroke
+    # Parse stroke — detect gradient references before resolving to a flat color
     stroke_val = get_attr("stroke")
     if stroke_val is not None:
-        style.stroke = parse_color(stroke_val)
+        gradient = _resolve_gradient_ref(stroke_val)
+        if gradient is not None:
+            style.gradient_stroke = gradient
+            style.stroke = "none"
+        else:
+            style.gradient_stroke = None
+            style.stroke = parse_color(stroke_val)
 
     # Parse stroke-width
     stroke_width_val = get_attr("stroke-width")
