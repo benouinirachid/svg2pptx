@@ -1,5 +1,6 @@
 """PowerPoint shape creation utilities."""
 
+import math
 from typing import Optional
 
 from pptx.shapes.base import BaseShape
@@ -8,7 +9,7 @@ from pptx.util import Emu
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.dml.color import RGBColor
 
-from svg2pptx.parser.styles import Style
+from svg2pptx.parser.styles import Style, LinearGradient
 from svg2pptx.parser.shapes import (
     ParsedShape,
     RectShape,
@@ -156,6 +157,48 @@ def create_line(
     return connector
 
 
+def _apply_gradient_fill(fill, gradient: LinearGradient) -> None:
+    """Apply a LinearGradient to a python-pptx FillFormat."""
+    if not gradient.stops:
+        fill.background()
+        return
+
+    # Compute angle: SVG direction (dx,dy, y-down) → python-pptx gradient_angle
+    # python-pptx gradient_angle is degrees CCW from East in screen (y-down) space.
+    # Formula: atan2(-dy, dx) gives that angle.
+    dx = gradient.x2 - gradient.x1
+    dy = gradient.y2 - gradient.y1
+    if dx == 0.0 and dy == 0.0:
+        angle_deg = 0.0
+    else:
+        angle_deg = math.degrees(math.atan2(-dy, dx)) % 360.0
+
+    fill.gradient()
+    fill.gradient_angle = angle_deg
+
+    # python-pptx initialises gradFill with exactly 2 stops.
+    # Manipulate the underlying gsLst XML to place all SVG stops.
+    import lxml.etree as etree
+
+    NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    gsLst = fill.gradient_stops._gsLst
+
+    # Remove the default 2 stops
+    for child in list(gsLst):
+        gsLst.remove(child)
+
+    for stop in gradient.stops:
+        pos = max(0, min(100000, int(round(stop.offset * 100000))))
+        hex_color = stop.color.lstrip("#").upper()
+        if len(hex_color) != 6:
+            continue
+        gs = etree.SubElement(gsLst, f"{{{NS}}}gs", pos=str(pos))
+        srgb = etree.SubElement(gs, f"{{{NS}}}srgbClr", val=hex_color)
+        if stop.opacity < 1.0:
+            alpha_val = max(0, min(100000, int(round(stop.opacity * 100000))))
+            etree.SubElement(srgb, f"{{{NS}}}alpha", val=str(alpha_val))
+
+
 def apply_style(shape: BaseShape, style: Style, disable_shadow: bool = True) -> None:
     """
     Apply SVG style to a PowerPoint shape.
@@ -178,19 +221,15 @@ def apply_style(shape: BaseShape, style: Style, disable_shadow: bool = True) -> 
 
     # Apply fill
     fill = shape.fill
-    if style.fill == "none":
-        fill.background()  # No fill
+    if style.gradient_fill is not None:
+        _apply_gradient_fill(fill, style.gradient_fill)
+    elif style.fill == "none":
+        fill.background()
     else:
         try:
             color = parse_hex_color(style.fill)
             fill.solid()
             fill.fore_color.rgb = color
-            
-            # Apply fill opacity
-            if style.effective_fill_opacity < 1.0:
-                # python-pptx doesn't directly support fill opacity
-                # We'd need to modify the XML directly for this
-                pass
         except ValueError:
             fill.background()
 
