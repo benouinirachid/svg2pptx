@@ -172,6 +172,238 @@ class TestAddToSlide:
         assert len(slide.shapes) >= 2
 
 
+class TestGradientOnRotatedShapes:
+    """Regression tests for gradient direction on rotated shapes."""
+
+    def _get_gradient_angle(self, prs) -> float:
+        """Extract gradient angle from the first gradient-filled shape."""
+        import lxml.etree as etree
+        NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+        for shape in prs.slides[0].shapes:
+            sp = shape._element
+            for gradFill in sp.iter(f"{{{NS}}}gradFill"):
+                lin = gradFill.find(f"{{{NS}}}lin")
+                if lin is not None:
+                    ang = int(lin.get("ang", "0"))
+                    return ang / 60000.0  # convert from 1/60000 degree units
+        return None
+
+    def test_gradient_direction_unrotated_rect(self):
+        """A horizontal gradient on a non-rotated rect stays horizontal (angle≈0°)."""
+        svg = '''<svg xmlns="http://www.w3.org/2000/svg"
+                      xmlns:xlink="http://www.w3.org/1999/xlink"
+                      width="100" height="50">
+          <defs>
+            <linearGradient id="g1">
+              <stop offset="0" style="stop-color:#000000;stop-opacity:1"/>
+              <stop offset="1" style="stop-color:#ffffff;stop-opacity:1"/>
+            </linearGradient>
+            <linearGradient xlink:href="#g1" id="g2"
+              x1="0" y1="0" x2="100" y2="0" gradientUnits="userSpaceOnUse"/>
+          </defs>
+          <rect x="0" y="0" width="100" height="50" fill="url(#g2)"/>
+        </svg>'''
+        converter = SVGConverter()
+        prs = converter.convert_string(svg)
+        angle = self._get_gradient_angle(prs)
+        assert angle is not None
+        # horizontal gradient → angle ≈ 0°
+        assert abs(angle % 360) < 1.0 or abs((angle % 360) - 360) < 1.0
+
+    def test_gradient_direction_rotated90_rect(self):
+        """A horizontal gradient on a rect rotated 90° becomes vertical (different from 0°)."""
+        svg = '''<svg xmlns="http://www.w3.org/2000/svg"
+                      xmlns:xlink="http://www.w3.org/1999/xlink"
+                      width="50" height="100">
+          <defs>
+            <linearGradient id="g1">
+              <stop offset="0" style="stop-color:#000000;stop-opacity:1"/>
+              <stop offset="1" style="stop-color:#ffffff;stop-opacity:1"/>
+            </linearGradient>
+            <linearGradient xlink:href="#g1" id="g2"
+              x1="0" y1="0" x2="100" y2="0" gradientUnits="userSpaceOnUse"/>
+          </defs>
+          <rect x="0" y="0" width="100" height="50" fill="url(#g2)"
+                transform="rotate(90)"/>
+        </svg>'''
+        converter = SVGConverter()
+        prs = converter.convert_string(svg)
+        angle = self._get_gradient_angle(prs)
+        assert angle is not None
+        # horizontal in local space + rotate(90) → vertical gradient, raw ang value = 90°
+        assert abs((angle % 360) - 90.0) < 1.0
+
+    def test_gradient_direction_rotated_minus90_rect(self):
+        """A horizontal gradient on a rect rotated -90° becomes vertical (opposite to rotate(90))."""
+        svg = '''<svg xmlns="http://www.w3.org/2000/svg"
+                      xmlns:xlink="http://www.w3.org/1999/xlink"
+                      width="50" height="100">
+          <defs>
+            <linearGradient id="g1">
+              <stop offset="0" style="stop-color:#000000;stop-opacity:1"/>
+              <stop offset="1" style="stop-color:#ffffff;stop-opacity:1"/>
+            </linearGradient>
+            <linearGradient xlink:href="#g1" id="g2"
+              x1="0" y1="0" x2="100" y2="0" gradientUnits="userSpaceOnUse"/>
+          </defs>
+          <rect x="0" y="0" width="100" height="50" fill="url(#g2)"
+                transform="rotate(-90)"/>
+        </svg>'''
+        converter = SVGConverter()
+        prs = converter.convert_string(svg)
+        angle = self._get_gradient_angle(prs)
+        assert angle is not None
+        # horizontal in local space + rotate(-90) → vertical gradient, raw ang value = 270°
+        assert abs((angle % 360) - 270.0) < 1.0
+
+
+class TestRadialAndStrokeGradients:
+    """Tests for radial gradients and gradients applied to strokes."""
+
+    NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+
+    def _gradfills(self, prs):
+        """Yield (parent_tag, gradFill_element) for every gradient in slide 0."""
+        for shape in prs.slides[0].shapes:
+            for gradFill in shape._element.iter(f"{{{self.NS}}}gradFill"):
+                parent = gradFill.getparent().tag.split("}")[-1]
+                yield parent, gradFill
+
+    def test_radial_fill_emits_path_gradient(self):
+        """A radialGradient fill becomes an OOXML <a:path path='circle'>."""
+        svg = '''<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+          <defs>
+            <radialGradient id="rg">
+              <stop offset="0" stop-color="#ff0000"/>
+              <stop offset="1" stop-color="#0000ff"/>
+            </radialGradient>
+          </defs>
+          <rect x="0" y="0" width="100" height="100" fill="url(#rg)"/>
+        </svg>'''
+        prs = SVGConverter().convert_string(svg)
+        gradients = list(self._gradfills(prs))
+        assert len(gradients) == 1
+        parent, gradFill = gradients[0]
+        assert parent == "spPr"  # a shape fill
+        path = gradFill.find(f"{{{self.NS}}}path")
+        assert path is not None and path.get("path") == "circle"
+        assert gradFill.find(f"{{{self.NS}}}lin") is None
+        stops = gradFill.findall(f"{{{self.NS}}}gsLst/{{{self.NS}}}gs")
+        assert len(stops) == 2
+
+    def test_radial_focus_shifted_by_center(self):
+        """cx/cy shift the fillToRect focus for objectBoundingBox units."""
+        svg = '''<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+          <defs>
+            <radialGradient id="rg" cx="0.3" cy="0.4">
+              <stop offset="0" stop-color="#ff0000"/>
+              <stop offset="1" stop-color="#0000ff"/>
+            </radialGradient>
+          </defs>
+          <rect x="0" y="0" width="100" height="100" fill="url(#rg)"/>
+        </svg>'''
+        prs = SVGConverter().convert_string(svg)
+        _, gradFill = next(self._gradfills(prs))
+        ftr = gradFill.find(f"{{{self.NS}}}path/{{{self.NS}}}fillToRect")
+        assert ftr is not None
+        assert ftr.get("l") == "30000"
+        assert ftr.get("t") == "40000"
+        assert ftr.get("r") == "70000"
+        assert ftr.get("b") == "60000"
+
+    def test_radial_inherits_via_href(self):
+        """A radialGradient inherits stops and geometry through xlink:href."""
+        svg = '''<svg xmlns="http://www.w3.org/2000/svg"
+                      xmlns:xlink="http://www.w3.org/1999/xlink"
+                      width="100" height="100">
+          <defs>
+            <radialGradient id="base" cx="0.25" cy="0.75">
+              <stop offset="0" stop-color="#00ff00"/>
+              <stop offset="1" stop-color="#000000"/>
+            </radialGradient>
+            <radialGradient id="child" xlink:href="#base"/>
+          </defs>
+          <rect x="0" y="0" width="100" height="100" fill="url(#child)"/>
+        </svg>'''
+        prs = SVGConverter().convert_string(svg)
+        _, gradFill = next(self._gradfills(prs))
+        stops = gradFill.findall(f"{{{self.NS}}}gsLst/{{{self.NS}}}gs")
+        assert len(stops) == 2
+        ftr = gradFill.find(f"{{{self.NS}}}path/{{{self.NS}}}fillToRect")
+        assert ftr.get("l") == "25000"  # cx=0.25 inherited
+        assert ftr.get("t") == "75000"  # cy=0.75 inherited
+
+    def test_gradient_on_stroke_emits_line_gradient(self):
+        """A gradient stroke produces a <a:gradFill> inside the line's <a:ln>."""
+        svg = '''<svg xmlns="http://www.w3.org/2000/svg"
+                      xmlns:xlink="http://www.w3.org/1999/xlink"
+                      width="100" height="100">
+          <defs>
+            <linearGradient id="lg">
+              <stop offset="0" stop-color="#000000"/>
+              <stop offset="1" stop-color="#ffffff"/>
+            </linearGradient>
+          </defs>
+          <rect x="10" y="10" width="80" height="80"
+                fill="none" stroke="url(#lg)" stroke-width="4"/>
+        </svg>'''
+        prs = SVGConverter().convert_string(svg)
+        gradients = list(self._gradfills(prs))
+        assert len(gradients) == 1
+        parent, gradFill = gradients[0]
+        assert parent == "ln"  # the gradient lives on the line, not the fill
+        stops = gradFill.findall(f"{{{self.NS}}}gsLst/{{{self.NS}}}gs")
+        assert len(stops) == 2
+
+    def test_gradient_stroke_on_line_connector(self):
+        """A gradient stroke on a <line> renders as a native connector gradient.
+
+        Regression: <line> uses the connector path (not apply_style), so a
+        gradient stroke must still produce an <a:gradFill> inside the line's
+        <a:ln> rather than silently rendering with no color.
+        """
+        svg = '''<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+          <defs>
+            <linearGradient id="lg">
+              <stop offset="0" stop-color="#000000"/>
+              <stop offset="1" stop-color="#ffffff"/>
+            </linearGradient>
+          </defs>
+          <line x1="0" y1="0" x2="100" y2="100"
+                stroke="url(#lg)" stroke-width="3"/>
+        </svg>'''
+        prs = SVGConverter().convert_string(svg)
+        gradients = list(self._gradfills(prs))
+        assert len(gradients) == 1
+        parent, gradFill = gradients[0]
+        assert parent == "ln"  # gradient lives on the connector's line
+        stops = gradFill.findall(f"{{{self.NS}}}gsLst/{{{self.NS}}}gs")
+        assert len(stops) == 2
+
+    def test_radial_pptx_roundtrips(self):
+        """A presentation with radial fill + stroke reloads without error."""
+        svg = '''<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+          <defs>
+            <radialGradient id="rg">
+              <stop offset="0" stop-color="#ff0000"/>
+              <stop offset="1" stop-color="#0000ff" stop-opacity="0.5"/>
+            </radialGradient>
+          </defs>
+          <rect x="0" y="0" width="100" height="100" fill="url(#rg)"/>
+          <circle cx="50" cy="50" r="20" fill="none"
+                  stroke="url(#rg)" stroke-width="5"/>
+        </svg>'''
+        prs = SVGConverter().convert_string(svg)
+        with tempfile.NamedTemporaryFile(suffix=".pptx", delete=False) as f:
+            path = f.name
+        try:
+            prs.save(path)
+            reopened = Presentation(path)
+            assert len(reopened.slides) == 1
+        finally:
+            os.unlink(path)
+
+
 class TestConfig:
     """Tests for configuration options."""
 
