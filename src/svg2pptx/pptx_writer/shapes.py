@@ -63,14 +63,24 @@ def create_rectangle(
     scale: float = 1.0,
 ) -> BaseShape:
     """Create a PowerPoint rectangle shape."""
-    # Apply transform to get actual position
-    x, y = rect.transform.apply(rect.x, rect.y)
-    
-    # Convert to EMU with scale
-    left = offset_x + px_to_emu(x * scale)
-    top = offset_y + px_to_emu(y * scale)
-    width = px_to_emu(rect.width * scale)
-    height = px_to_emu(rect.height * scale)
+    # Transform all 4 corners and take the axis-aligned bounding box.
+    # This handles rotate() and other transforms that change the effective
+    # width/height, not just the position.
+    corners = rect.transform.apply_to_points([
+        (rect.x, rect.y),
+        (rect.x + rect.width, rect.y),
+        (rect.x + rect.width, rect.y + rect.height),
+        (rect.x, rect.y + rect.height),
+    ])
+    xs = [p[0] for p in corners]
+    ys = [p[1] for p in corners]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+
+    left = offset_x + px_to_emu(min_x * scale)
+    top = offset_y + px_to_emu(min_y * scale)
+    width = px_to_emu((max_x - min_x) * scale)
+    height = px_to_emu((max_y - min_y) * scale)
 
     # Choose shape type based on corner radius
     if rect.rx > 0 or rect.ry > 0:
