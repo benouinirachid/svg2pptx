@@ -6,6 +6,7 @@ import tempfile
 import os
 
 from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 from svg2pptx import svg_to_pptx, SVGConverter, Config
 
@@ -191,3 +192,35 @@ class TestConfig:
         assert config.scale == 2.0
         assert config.curve_tolerance == 0.5
         assert config.preserve_groups is False
+
+
+class TestGroupExtents:
+    """Regression tests for group bounding-box extents."""
+
+    def test_freeform_group_has_nonzero_extents(self):
+        """A group wrapping freeform paths must have a non-degenerate box.
+
+        Freeforms are injected directly into the spTree and bypass python-pptx's
+        extent recalculation, so without an explicit recalc such a group keeps a
+        zero-size box (cx=cy=0), which some renderers fail to draw until the
+        group is moved.
+        """
+        svg = '''<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">
+          <g>
+            <path d="M0 0 L40 0 L40 40 Z" fill="red"/>
+            <path d="M60 0 L100 0 L100 40 Z" fill="blue"/>
+          </g>
+        </svg>'''
+        # flatten_groups=False keeps the SVG <g> as a real PowerPoint group.
+        prs = SVGConverter(Config(flatten_groups=False)).convert_string(svg)
+
+        def all_groups(shapes):
+            for sh in shapes:
+                if sh.shape_type == MSO_SHAPE_TYPE.GROUP:
+                    yield sh
+                    yield from all_groups(sh.shapes)
+
+        groups = list(all_groups(prs.slides[0].shapes))
+        assert groups  # sanity: a group was actually created
+        for g in groups:
+            assert g.width > 0 and g.height > 0
