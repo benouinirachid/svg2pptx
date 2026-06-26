@@ -58,6 +58,13 @@ def create_group(
             group_shapes, child, offset_x, offset_y, scale, flatten, config
         )
 
+    # Freeform shapes are written straight into the group's spTree, bypassing
+    # python-pptx's automatic extent recalculation. Without this, a group whose
+    # children are all freeforms keeps a zero-size bounding box (cx=cy=0), which
+    # is degenerate and makes some renderers (e.g. PowerPoint web) fail to draw
+    # the children until the group is moved. Recalculate explicitly.
+    group_shapes._recalculate_extents()  # pyright: ignore[reportPrivateUsage]
+
     return group_shape
 
 
